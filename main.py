@@ -32,7 +32,7 @@ groq = Groq(api_key=GROQ_API_KEY)
 
 # Keep recent conversation turns per Telegram chat for multi-turn questions.
 chat_history: dict[int, deque[dict[str, str]]] = defaultdict(
-    lambda: deque(maxlen=12)
+    lambda: deque(maxlen=4)
 )
 
 SYSTEM_PROMPT = """
@@ -147,10 +147,15 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
         }
     ]
 
-    history = list(chat_history[chat_id])
+    history = list(chat_history[chat_id])[-4:]
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
-    messages.append({"role": "user", "content": latest_text})
+    messages.append(
+        {
+        "role": "user",
+        "content": latest_text[:12000]
+        }
+    )
 
     events.append(
         {
@@ -171,7 +176,7 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
     model=MODEL,
     messages=messages,
     temperature=0,
-    max_completion_tokens=8192,
+    max_completion_tokens=2048,
     )
 
     msg = completion.choices[0].message
@@ -278,8 +283,22 @@ async def telegram_webhook(request: Request):
     if not isinstance(text, str) or not isinstance(chat_id, int):
         return JSONResponse({"ok": True})
 
+    if text.strip().lower() == "/reset":
+        chat_history.pop(chat_id, None)
+
+    await send_telegram_json(
+        chat_id,
+        {
+            "answer": {"status": "conversation_reset"},
+            "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
+        },
+    )
+
+    return JSONResponse({"ok": True})
+
     # Telegram retries unsuccessful webhooks. Return 200 even if analysis fails,
     # after sending a valid JSON failure response.
+    
     try:
         answer, events = solve_question(chat_id, text)
         final_payload = {
