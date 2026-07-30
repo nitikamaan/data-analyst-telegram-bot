@@ -13,6 +13,7 @@ load_dotenv()
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from groq import Groq
 
@@ -288,12 +289,21 @@ def public_run_log():
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     if WEBHOOK_SECRET:
-        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if received != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+        received_secret = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            "",
+        )
+
+        if received_secret != WEBHOOK_SECRET:
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid webhook secret",
+            )
 
     update = await request.json()
+
     message = update.get("message") or update.get("edited_message")
+
     if not message:
         return JSONResponse({"ok": True})
 
@@ -304,55 +314,92 @@ async def telegram_webhook(request: Request):
     if not isinstance(text, str) or not isinstance(chat_id, int):
         return JSONResponse({"ok": True})
 
-    if text.strip().lower() == "/reset":
+    text = text.strip()
+
+    if not text:
+        return JSONResponse({"ok": True})
+
+    # Reset ONLY when the received message is exactly /reset
+    first_word = text.split()[0].lower()
+
+    if first_word == "/reset" or first_word.startswith("/reset@"):
         chat_history.pop(chat_id, None)
 
-    await send_telegram_json(
-        chat_id,
-        {
-            "answer": {"status": "conversation_reset"},
+        reset_payload = {
+            "answer": {
+                "status": "conversation_reset"
+            },
             "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
-        },
-    )
+        }
 
-    return JSONResponse({"ok": True})
+        write_jsonl(
+            [
+                {
+                    "event": "conversation_reset",
+                    "timestamp": now_iso(),
+                    "chat_id": chat_id,
+                    "received_text": text,
+                }
+            ]
+        )
 
-    # Telegram retries unsuccessful webhooks. Return 200 even if analysis fails,
-    # after sending a valid JSON failure response.
-    
+        await send_telegram_json(chat_id, reset_payload)
+
+        return JSONResponse({"ok": True})
+
+    # Every other message must reach this part
     try:
-        answer, events = solve_question(chat_id, text)
+        answer, events = await run_in_threadpool(
+            solve_question,
+            chat_id,
+            text,
+        )
+
         final_payload = {
             "answer": answer,
             "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
         }
+
         events.append(
             {
                 "event": "telegram_reply",
                 "timestamp": now_iso(),
+                "received_text": text,
                 "payload": final_payload,
             }
         )
+
         write_jsonl(events)
-        await send_telegram_json(chat_id, final_payload)
-    except Exception as exc:
-        failure_events = [
-            {
-                "event": "run_failed",
-                "timestamp": now_iso(),
-                "chat_id": chat_id,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
-        ]
-        write_jsonl(failure_events)
-        # Still obey the required two-key JSON envelope.
+
         await send_telegram_json(
             chat_id,
-            {
-                "answer": {"error": "analysis_failed"},
-                "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
+            final_payload,
+        )
+
+    except Exception as exc:
+        failure_payload = {
+            "answer": {
+                "error": "analysis_failed"
             },
+            "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
+        }
+
+        write_jsonl(
+            [
+                {
+                    "event": "run_failed",
+                    "timestamp": now_iso(),
+                    "chat_id": chat_id,
+                    "received_text": text,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            ]
+        )
+
+        await send_telegram_json(
+            chat_id,
+            failure_payload,
         )
 
     return JSONResponse({"ok": True})
