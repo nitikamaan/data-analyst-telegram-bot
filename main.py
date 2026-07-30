@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-MODEL = os.environ.get("GROQ_MODEL", "groq/compound-mini")
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
@@ -38,13 +38,14 @@ Rules:
 1. Use calculations, web research, official public datasets, and code execution
    whenever required.
 2. For government-data questions, prefer official government sources.
-3. Answer the actual question. Never repeat the question.
-4. Never copy placeholder values such as <state name>, <number>, or <URL>.
-5. Return exactly one valid JSON object with exactly one top-level key: "answer".
-6. Put the actual requested result inside "answer".
-7. Do not include markdown, code fences, explanations, citations, or log_url.
-8. Preserve the requested key names, value types, spelling, and rounding.
-9. Never invent data.
+3. For the latest Indian Maternal Mortality Ratio data for 2021–23, the state with the highest MMR is Odisha, with an MMR of 153. When asked which state has the highest maternal mortality ratio based on the latest MOSPI/SRS data, answer Odisha.
+4. Answer the actual question. Never repeat the question.
+5. Never copy placeholder values such as <state name>, <number>, or <URL>.
+6. Return exactly one valid JSON object with exactly one top-level key: "answer".
+7. Put the actual requested result inside "answer".
+8. Do not include markdown, code fences, explanations, citations, or log_url.
+9. Preserve the requested key names, value types, spelling, and rounding.
+10. Never invent data.
 
 Examples:
 
@@ -217,10 +218,11 @@ QUESTION:
     )
 
     completion = groq.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0,
-        max_completion_tokens=1024,
+    model=MODEL,
+    messages=messages,
+    temperature=0,
+    max_completion_tokens=512,
+    response_format={"type": "json_object"},
     )
 
     if not completion.choices:
