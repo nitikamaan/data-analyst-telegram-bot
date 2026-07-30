@@ -19,7 +19,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-MODEL = os.environ.get("GROQ_MODEL", "groq/compound")
+MODEL = os.environ.get("GROQ_MODEL", "groq/compound-mini")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
