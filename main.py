@@ -168,19 +168,10 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
     )
 
     completion = groq.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0,
-        max_completion_tokens=8192,
-        compound_custom={
-            "tools": {
-                "enabled_tools": [
-                    "web_search",
-                    "visit_website",
-                    "code_interpreter",
-                ]
-            }
-        },
+    model=MODEL,
+    messages=messages,
+    temperature=0,
+    max_completion_tokens=8192,
     )
 
     msg = completion.choices[0].message
