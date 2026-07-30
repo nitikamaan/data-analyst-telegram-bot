@@ -47,7 +47,7 @@ Rules:
 2. Use web search, website visiting, code execution, and calculations whenever useful.
 3. Respect the complete recent conversation because questions may be multi-turn.
 4. The user's latest message usually states the exact required JSON shape.
-5. Return ONLY one valid JSON object with exactly one top-level key: "answer".
+5. Return only one valid JSON object with exactly one top-level key: "answer". Never repeat or copy the user's question or placeholder template.
 6. Put inside "answer" precisely the value/object/list requested by the user.
 7. Do not include markdown, explanations, citations, code fences, or a log_url.
 8. Preserve requested spelling, data types, rounding, ordering, and key names.
@@ -151,10 +151,21 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append(
-        {
+    {
         "role": "user",
-        "content": latest_text[:12000]
-        }
+        "content": f"""
+        Analyze the question below and give the real answer.
+
+        Do not repeat the question.
+        Do not copy placeholder values such as "<state name>".
+        Return only this internal JSON format:
+
+        {{"answer": {{"state": "actual state name"}}}}
+        
+        QUESTION:
+        {latest_text[:12000]}
+"""
+    }
     )
 
     events.append(
@@ -197,6 +208,16 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
     )
 
     parsed = extract_json_object(raw_text)
+    raw_lower = raw_text.lower()
+    invalid_placeholders = [
+        "<state name>",
+        "<public wget-able url>",
+        "<url>",
+        "actual state name",
+        ]
+    if any(value in raw_lower for value in invalid_placeholders):
+        raise ValueError("Model copied the JSON template instead of answering.")
+
     answer = normalize_answer_object(parsed)
 
     events.append(
