@@ -1,9 +1,7 @@
 import json
 import os
-import re
 import time
 import uuid
-from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -31,28 +29,30 @@ LATEST_LOG = LOG_DIR / "run.jsonl"
 app = FastAPI(title="Data Analyst Telegram Bot")
 groq = Groq(api_key=GROQ_API_KEY)
 
-# Keep recent conversation turns per Telegram chat for multi-turn questions.
-chat_history: dict[int, deque[dict[str, str]]] = defaultdict(
-    lambda: deque(maxlen=4)
-)
-
 SYSTEM_PROMPT = """
 You are a rigorous data-analysis agent.
 
-You receive Telegram messages containing data-analysis questions. The data may
-be inline or available through a public URL, including official government
-datasets such as MOSPI.
+Solve the user's data-analysis question accurately.
 
 Rules:
-1. Solve the user's latest question accurately.
-2. Use web search, website visiting, code execution, and calculations whenever useful.
-3. Respect the complete recent conversation because questions may be multi-turn.
-4. The user's latest message usually states the exact required JSON shape.
-5. Return only one valid JSON object with exactly one top-level key: "answer". Never repeat or copy the user's question or placeholder template.
-6. Put inside "answer" precisely the value/object/list requested by the user.
-7. Do not include markdown, explanations, citations, code fences, or a log_url.
-8. Preserve requested spelling, data types, rounding, ordering, and key names.
-9. Never invent data. If a public source is required, find and analyze it.
+1. Use calculations, web research, official public datasets, and code execution
+   whenever required.
+2. For government-data questions, prefer official government sources.
+3. Answer the actual question. Never repeat the question.
+4. Never copy placeholder values such as <state name>, <number>, or <URL>.
+5. Return exactly one valid JSON object with exactly one top-level key: "answer".
+6. Put the actual requested result inside "answer".
+7. Do not include markdown, code fences, explanations, citations, or log_url.
+8. Preserve the requested key names, value types, spelling, and rounding.
+9. Never invent data.
+
+Examples:
+
+User asks for a mean:
+{"answer":{"mean":20}}
+
+User asks for a state:
+{"answer":{"state":"Assam"}}
 """
 
 def now_iso() -> str:
@@ -83,25 +83,32 @@ def jsonable(value: Any) -> Any:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    text = (text or "").strip()
+    """
+    Parse the model response and prefer the last valid JSON object whose
+    top-level key is exactly "answer". This avoids accidentally extracting
+    a copied template from earlier in the response.
+    """
+    cleaned = (text or "").strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "", 1).replace("```", "", 1).strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
 
     try:
-        value = json.loads(text)
+        value = json.loads(cleaned)
         if isinstance(value, dict):
             return value
     except json.JSONDecodeError:
         pass
 
-    # Fallback: locate the first balanced JSON object.
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("Model returned no JSON object.")
-
+    objects: list[dict[str, Any]] = []
+    start_index: int | None = None
     depth = 0
     in_string = False
     escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
+
+    for index, ch in enumerate(cleaned):
         if in_string:
             if escaped:
                 escaped = False
@@ -114,17 +121,29 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if ch == '"':
             in_string = True
         elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
             if depth == 0:
-                value = json.loads(text[start : i + 1])
-                if not isinstance(value, dict):
-                    raise ValueError("JSON result was not an object.")
-                return value
+                start_index = index
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start_index is not None:
+                candidate = cleaned[start_index:index + 1]
+                try:
+                    value = json.loads(candidate)
+                    if isinstance(value, dict):
+                        objects.append(value)
+                except json.JSONDecodeError:
+                    pass
+                start_index = None
 
-    raise ValueError("Could not parse a complete JSON object.")
+    if not objects:
+        raise ValueError("Model returned no valid JSON object.")
 
+    for value in reversed(objects):
+        if set(value.keys()) == {"answer"}:
+            return value
+
+    return objects[-1]
 
 def normalize_answer_object(model_object: dict[str, Any]) -> Any:
     """
@@ -136,38 +155,47 @@ def normalize_answer_object(model_object: dict[str, Any]) -> Any:
     return model_object
 
 
-def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, Any]]]:
+def solve_question(
+    chat_id: int,
+    latest_text: str,
+) -> tuple[Any, list[dict[str, Any]]]:
+
     run_id = str(uuid.uuid4())
+
+    # Limit the current question size.
+    safe_text = latest_text[:4000]
+
     events: list[dict[str, Any]] = [
         {
             "event": "run_started",
             "run_id": run_id,
             "timestamp": now_iso(),
             "chat_id": chat_id,
-            "latest_message": latest_text,
+            "message_length": len(latest_text),
+            "message_preview": safe_text[:500],
         }
     ]
 
-    history = list(chat_history[chat_id])[-4:]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history)
-    messages.append(
-    {
-        "role": "user",
-        "content": f"""
-        Analyze the question below and give the real answer.
+    # Do not include previous chat history.
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": f"""
+Solve the following question.
 
-        Do not repeat the question.
-        Do not copy placeholder values such as "<state name>".
-        Return only this internal JSON format:
+Return the real answer, not the placeholder template.
+Do not repeat the question.
+Return only one JSON object with the top-level key "answer".
 
-        {{"answer": {{"state": "actual state name"}}}}
-        
-        QUESTION:
-        {latest_text[:12000]}
-"""
-    }
-    )
+QUESTION:
+{safe_text}
+""".strip(),
+        },
+    ]
 
     events.append(
         {
@@ -175,7 +203,11 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
             "run_id": run_id,
             "timestamp": now_iso(),
             "model": MODEL,
-            "messages": messages,
+            "message_count": len(messages),
+            "prompt_character_count": sum(
+                len(message["content"])
+                for message in messages
+            ),
             "enabled_tools": [
                 "web_search",
                 "visit_website",
@@ -185,41 +217,66 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
     )
 
     completion = groq.chat.completions.create(
-    model=MODEL,
-    messages=messages,
-    temperature=0,
-    max_completion_tokens=2048,
+        model=MODEL,
+        messages=messages,
+        temperature=0,
+        max_completion_tokens=1024,
     )
+
+    if not completion.choices:
+        raise ValueError("Groq returned no completion choices.")
 
     msg = completion.choices[0].message
     raw_text = msg.content or ""
-    executed_tools = jsonable(getattr(msg, "executed_tools", None))
-    reasoning = jsonable(getattr(msg, "reasoning", None))
+
+    if not raw_text.strip():
+        raise ValueError("Groq returned an empty response.")
+
+    executed_tools = jsonable(
+        getattr(msg, "executed_tools", None)
+    )
+
+    reasoning = jsonable(
+        getattr(msg, "reasoning", None)
+    )
 
     events.append(
         {
             "event": "llm_response",
             "run_id": run_id,
             "timestamp": now_iso(),
-            "raw_content": raw_text,
+            "raw_content": raw_text[:6000],
             "executed_tools": executed_tools,
             "reasoning": reasoning,
-            "usage": jsonable(getattr(completion, "usage", None)),
+            "usage": jsonable(
+                getattr(completion, "usage", None)
+            ),
         }
     )
 
     parsed = extract_json_object(raw_text)
-    raw_lower = raw_text.lower()
-    invalid_placeholders = [
-        "<state name>",
-        "<public wget-able url>",
-        "<url>",
-        "actual state name",
-        ]
-    if any(value in raw_lower for value in invalid_placeholders):
-        raise ValueError("Model copied the JSON template instead of answering.")
 
     answer = normalize_answer_object(parsed)
+
+    if answer is None:
+        raise ValueError("Model returned a null answer.")
+
+    answer_text = json.dumps(answer, ensure_ascii=False).lower()
+    invalid_placeholders = [
+        "<state name>",
+        "<number>",
+        "<value>",
+        "<answer>",
+        "<public wget-able url>",
+        "<public url>",
+        "<url>",
+        "actual state name",
+    ]
+
+    if any(placeholder in answer_text for placeholder in invalid_placeholders):
+        raise ValueError(
+            "Model copied a placeholder instead of answering."
+        )
 
     events.append(
         {
@@ -227,15 +284,6 @@ def solve_question(chat_id: int, latest_text: str) -> tuple[Any, list[dict[str, 
             "run_id": run_id,
             "timestamp": now_iso(),
             "answer": answer,
-        }
-    )
-
-    # Save only user/assistant semantic context, not the public log URL.
-    chat_history[chat_id].append({"role": "user", "content": latest_text})
-    chat_history[chat_id].append(
-        {
-            "role": "assistant",
-            "content": json.dumps({"answer": answer}, ensure_ascii=False),
         }
     )
 
@@ -323,8 +371,6 @@ async def telegram_webhook(request: Request):
     first_word = text.split()[0].lower()
 
     if first_word == "/reset" or first_word.startswith("/reset@"):
-        chat_history.pop(chat_id, None)
-
         reset_payload = {
             "answer": {
                 "status": "conversation_reset"
@@ -379,7 +425,8 @@ async def telegram_webhook(request: Request):
     except Exception as exc:
         failure_payload = {
             "answer": {
-                "error": "analysis_failed"
+                "error": "analysis_failed",
+                "detail": str(exc)[:500],
             },
             "log_url": f"{PUBLIC_BASE_URL}/run.jsonl",
         }
